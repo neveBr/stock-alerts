@@ -1,0 +1,11 @@
+{
+  "stocks": [
+    {
+      "ticker": "CRML",
+      "name": "Critical Metals"
+    }
+  ],
+  "market_alerts": true,
+  "min_score": 1,
+  "price_move_alert_percent": 5
+}
