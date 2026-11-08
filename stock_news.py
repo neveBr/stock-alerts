@@ -661,8 +661,9 @@ def check_once():
     first_run = not state.get("initialized")
     t0 = time.time()
 
+    fill_sectors(wl["stocks"])  # sector of each stock, for "/sectors mine" (and /list)
     handle_commands(wl, state)
-    fill_sectors(wl["stocks"])  # sector of each stock, for "/sectors mine"
+    fill_sectors(wl["stocks"])  # stocks added by this run's commands
     save(WATCHLIST, wl)  # commands take effect even if a later step fails
     show_latest = set(state.pop("show_latest", []))
     min_score = wl.get("min_score", 1)
