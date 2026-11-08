@@ -2,7 +2,10 @@
   "stocks": [
     {
       "ticker": "CRML",
-      "name": "Critical Metals"
+      "name": "Critical Metals",
+      "sectors": [
+        "Critical minerals & mining"
+      ]
     }
   ],
   "market_alerts": true,
