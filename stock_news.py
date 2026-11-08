@@ -132,6 +132,54 @@ SECTORS = [
     ("Agriculture", r"\b(farmers?|soybeans?|wheat|corn|agricultur\w*)\b"),
 ]
 SECTORS = [(name, re.compile(p, re.I)) for name, p in SECTORS]
+# Yahoo sector / industry -> our sectors (for "/sectors mine")
+STOCK_SECTOR_RULES = [
+    ("Semiconductors", r"semiconductor"),
+    ("Energy", r"^energy\||oil|gas|coal|uranium|solar"),
+    ("Banks & finance", r"^financial services\||bank|insurance|credit services|capital markets"),
+    ("Crypto", r"crypto|blockchain|bitcoin"),
+    ("Healthcare & pharma", r"^healthcare\||drug|biotech|medical|pharma"),
+    ("Defense", r"aerospace & defense|defense"),
+    ("Critical minerals & mining", r"mining|metals|gold|silver|copper|aluminum|steel|uranium|lithium"),
+    ("Steel & aluminum", r"steel|aluminum"),
+    ("Autos & EV", r"auto"),
+    ("Tech & AI", r"^technology\||^communication services\||software|internet|semiconductor|electronic"),
+    ("Real estate", r"^real estate\||reit|residential construction|real estate"),
+    ("Retail & consumer", r"retail|stores|apparel|restaurants|household|packaged foods|beverages"),
+    ("Airlines & travel", r"airline|travel|lodging|resorts|cruise"),
+    ("Agriculture", r"farm|agricultur|fertilizer"),
+]
+STOCK_SECTOR_RULES = [(n, re.compile(p, re.I)) for n, p in STOCK_SECTOR_RULES]
+
+
+def stock_sectors(ticker):
+    """Our sector names for a stock, from Yahoo's sector + industry. [] if unknown."""
+    try:
+        d = json.loads(http_get("https://query2.finance.yahoo.com/v1/finance/search?" + urllib.parse.urlencode(
+            {"q": ticker, "quotesCount": 3, "newsCount": 0})))
+        q = next((x for x in d.get("quotes", []) if str(x.get("symbol", "")).upper() == ticker.upper()), None)
+        if not q:
+            return []
+        key = f"{q.get('sectorDisp') or q.get('sector') or ''}|{q.get('industryDisp') or q.get('industry') or ''}"
+        return [n for n, rx in STOCK_SECTOR_RULES if rx.search(key)]
+    except Exception as e:
+        print(f"[warn] sector {ticker}: {e}", file=sys.stderr)
+        return None  # unknown for now – try again next run
+
+
+def fill_sectors(stocks, limit=150):
+    """Look up sectors for stocks that don't have them yet (a few per run)."""
+    todo = [s for s in stocks if "sectors" not in s][:limit]
+    if not todo:
+        return
+    with ThreadPoolExecutor(THREADS) as ex:
+        for s, secs in zip(todo, ex.map(lambda s: stock_sectors(s["ticker"]), todo)):
+            if secs is not None:
+                s["sectors"] = secs
+
+
+def my_sectors(wl):
+    return sorted({x for s in wl["stocks"] for x in s.get("sectors", [])})
 MACRO_QUERIES = [
     '("Fed" OR "Federal Reserve" OR "FOMC") (cuts OR raises OR holds) rates when:1d',
     '("inflation" OR "CPI" OR "payrolls" OR "jobs report" OR "GDP" OR "unemployment rate") when:1d',
@@ -415,6 +463,8 @@ HELP = f"""<b>📊 Stock Alerts – commands</b>
 /remove all – empty the list
 /list – your stocks + prices
 /market on|off – 🚨 critical company news + 🌍 market & sector news
+/sectors mine – sector news only for your stocks' sectors (+ whole-market news)
+/sectors all – sector news for every sector
 /level 1|2|3 – which watchlist news to send (1 = most, 3 = only big)
 /help – this message"""
 
@@ -465,6 +515,13 @@ def handle_commands(wl, state):
         reply = run_command(cmd, [rest] if rest.strip() else [], wl, state)
         if reply:
             send(reply, chat)
+
+
+def sectors_status(wl):
+    if wl.get("sector_filter", "mine") == "all":
+        return "Sector news: ALL sectors"
+    mine = my_sectors(wl)
+    return "Sector news: only your sectors – " + (", ".join(mine) if mine else "none yet")
 
 
 def fmt_price(p):
@@ -548,7 +605,13 @@ def run_command(cmd, args, wl, state):
             lines = [" · ".join(lines[i:i + 6]) for i in range(0, len(lines), 6)]
         return (f"<b>Your stocks ({len(stocks)}):</b>\n" + "\n".join(lines) +
                 f"\n\nMarket-wide news: {'ON' if wl.get('market_alerts') else 'OFF'}"
+                f"\n{sectors_status(wl)}"
                 f"\nLevel: {wl.get('min_score', 1)}")
+    if cmd == "/sectors":
+        if args and args[0].strip().lower() in ("mine", "all"):
+            wl["sector_filter"] = args[0].strip().lower()
+        fill_sectors(wl["stocks"])
+        return sectors_status(wl) + "\n(Whole-market news and 🚨 company news are always sent.)"
     if cmd == "/market":
         if args and args[0].strip().lower() in ("on", "off"):
             wl["market_alerts"] = args[0].strip().lower() == "on"
@@ -599,6 +662,7 @@ def check_once():
     t0 = time.time()
 
     handle_commands(wl, state)
+    fill_sectors(wl["stocks"])  # sector of each stock, for "/sectors mine"
     save(WATCHLIST, wl)  # commands take effect even if a later step fails
     show_latest = set(state.pop("show_latest", []))
     min_score = wl.get("min_score", 1)
@@ -676,18 +740,25 @@ def check_once():
                 tick = f" <b>${esc(m.group(1).upper())}</b>" if m else ""
                 out.append(f"🚨 <b>Critical company news</b>{tick}\n<a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>\n"
                            f"<i>[{esc(i['source'])} · {esc(k)}]</i>")
+        only_mine = wl.get("sector_filter", "mine") == "mine"
+        mine = set(my_sectors(wl))
         for i in fetch_macro_news():
             lid = link_id(i["link"])
             if lid in seen:
                 continue
             seen[lid] = today
             ev = macro_event(i["title"])
-            if ev:
-                name, sectors = ev
-                where = ", ".join(sectors) if sectors else "Whole market"
-                icon = "🏭 <b>Sector news</b>" if sectors else "🌍 <b>Market news</b>"
-                out.append(f"{icon} · {esc(name)}\n<a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>\n"
-                           f"<i>Affects: {esc(where)}</i>")
+            if not ev:
+                continue
+            name, sectors = ev
+            # Whole-market news always goes out; sector news only for your sectors (unless /sectors all)
+            if sectors and only_mine and not (set(sectors) & mine):
+                print(f"[skip] sector news not in your sectors ({', '.join(sectors)}): {i['title'][:80]}")
+                continue
+            where = ", ".join(sectors) if sectors else "Whole market"
+            icon = "🏭 <b>Sector news</b>" if sectors else "🌍 <b>Market news</b>"
+            out.append(f"{icon} · {esc(name)}\n<a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>\n"
+                       f"<i>Affects: {esc(where)}</i>")
         if not market_silent:
             for msg in out[:MAX_MARKET_ALERTS]:
                 send(msg)
