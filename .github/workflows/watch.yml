@@ -6,7 +6,8 @@ on:
   workflow_dispatch:         # "Run workflow" button for manual runs
 
 permissions:
-  contents: write            # to save watchlist.json / state.json back to the repo
+  contents: write            # to save watchlist.json back to the repo after Telegram commands
+  actions: write             # to save state in the Actions cache
 
 concurrency:
   group: stock-alerts
@@ -15,9 +16,18 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+
+      # state.json (sent links, rotation, Telegram offset) lives in the Actions cache,
+      # so the repo doesn't get a commit every 5 minutes
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
 
       - name: Check news and Telegram commands
         env:
@@ -26,14 +36,21 @@ jobs:
         run: python3 stock_news.py
 
       - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+
+      - name: Save watchlist (only when a command changed it)
         run: |
           git config user.name "stock-alerts-bot"
           git config user.email "stock-alerts-bot@users.noreply.github.com"
-          git add watchlist.json state.json
+          git add watchlist.json
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Update state [skip ci]"
+            git commit -m "Update watchlist [skip ci]"
             git pull --rebase -X theirs || true
             git push
           fi
