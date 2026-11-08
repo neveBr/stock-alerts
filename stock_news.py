@@ -52,6 +52,19 @@ CRITICAL = [
     "ceo ousted", "ceo fired", "massive recall", "data breach", "antitrust lawsuit",
     "doj sues", "ftc sues", "blocks merger", "reverse stock split", "stock split",
 ]
+# Contract signings: alert only if the headline mentions >= BIG_CONTRACT_USD
+CONTRACT = ["contract", "awarded", "deal", "order", "agreement"]
+BIG_CONTRACT_USD = 100_000_000
+MAX_MARKET_ALERTS = 10
+MONEY_RE = re.compile(r"(?:US|A|C)?[$€£]\s?(\d+(?:[.,]\d+)?)\s?(trillion|billion|bln|bn|million|mln|mn|[bmt])\b", re.I)
+
+
+def money_in(text):
+    """Largest dollar amount in the text, e.g. '$1.2 billion' -> 1.2e9."""
+    mult = {"t": 1e12, "trillion": 1e12, "b": 1e9, "billion": 1e9, "bln": 1e9, "bn": 1e9,
+            "m": 1e6, "million": 1e6, "mln": 1e6, "mn": 1e6}
+    vals = [float(n.replace(",", ".")) * mult[u.lower()] for n, u in MONEY_RE.findall(text)]
+    return max(vals) if vals else 0
 # Law-firm "investor notice" spam etc.
 NOISE = ["class action", "investor notice", "investors who", "shareholder alert",
          "reminds investors", "law firm", "rosen", "pomerantz", "levi & korsinsky",
@@ -82,6 +95,11 @@ def is_critical(text):
     for k in CRITICAL:
         if k in t:
             return k
+    for k in CONTRACT:
+        if k in t:
+            amount = money_in(text)
+            if amount >= BIG_CONTRACT_USD:
+                return f"big contract ${amount / 1e9:.1f}B" if amount >= 1e9 else f"big contract ${amount / 1e6:.0f}M"
     return None
 
 
@@ -232,7 +250,8 @@ def fetch_market_news():
         print(f"[warn] PRN: {e}", file=sys.stderr)
     q = ('"to acquire" OR "agrees to buy" OR "files for bankruptcy" OR "FDA approves" OR '
          '"trading halt" OR "merger agreement" OR "cuts guidance" OR "CEO resigns" OR '
-         '"SEC charges" OR "buyout offer" when:1d')
+         '"SEC charges" OR "buyout offer" OR "awarded contract" OR "billion contract" OR '
+         '"million contract" OR "wins contract" OR "supply agreement" OR "billion deal" when:1d')
     try:
         # Only serious financial outlets, so "Cyprus to acquire fighter jets" doesn't get in
         items += [i for i in google_news(q) if i["domain"].replace("www.", "") in FINANCIAL_SITES]
@@ -378,7 +397,7 @@ def check_once():
                 continue
             seen.add(i["link"])
             k = is_critical(i["title"])
-            if not k or market_silent or sent >= 5:
+            if not k or market_silent or sent >= MAX_MARKET_ALERTS:
                 continue
             m = TICKER_RE.search(i["title"] + " " + i["desc"])
             tick = f" <b>${esc(m.group(1).upper())}</b>" if m else ""
