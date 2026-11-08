@@ -265,13 +265,36 @@ def fetch_market_news():
 
 # ---------- telegram commands ----------
 HELP = """<b>📊 Stock Alerts – commands</b>
-/add TICKER – add a stock (e.g. /add TSLA)
-/add TICKER Name – with a custom name for searching
-/remove TICKER – remove a stock
+/add TSLA – add a stock
+/add TSLA AAPL NVDA – add several at once (spaces, commas or new lines)
+/add TSLA=Tesla Motors – with a custom name for searching
+/remove TSLA AAPL – remove one or several
 /list – your stocks + prices
 /market on|off – critical news on ANY company
 /level 1|2|3 – which watchlist news to send (1 = most, 3 = only big)
 /help – this message"""
+MAX_PER_COMMAND = 30
+
+
+def parse_items(args):
+    """'/add TSLA AAPL, NVDA=Nvidia Corp' -> [('TSLA',None),('AAPL',None),('NVDA','Nvidia Corp')]"""
+    raw = " ".join(args)
+    out, seen = [], set()
+    for chunk in re.split(r"[,\n;]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            t, name = chunk.split("=", 1)
+            pairs = [(t, name.strip() or None)]
+        else:
+            pairs = [(t, None) for t in chunk.split()]
+        for t, name in pairs:
+            t = t.strip().upper().lstrip("$")
+            if t and t not in seen:
+                seen.add(t)
+                out.append((t, name))
+    return out
 
 
 def handle_commands(wl, state):
@@ -304,27 +327,52 @@ def run_command(cmd, args, wl, state):
     if cmd in ("/start", "/help"):
         return HELP
     if cmd == "/add":
-        if not args:
-            return "Usage: /add TICKER [Name]"
-        t = args[0].upper().lstrip("$")
-        if any(s["ticker"] == t for s in stocks):
-            return f"{t} is already on the list."
-        info = price_info(t)
-        if not info or info["price"] is None:
-            return f"❓ Couldn't find ticker {esc(t)} on Yahoo Finance."
-        name = " ".join(args[1:]) or clean_name(info["name"] or t)
-        stocks.append({"ticker": t, "name": name})
-        state.setdefault("new_tickers", []).append(t)
-        return (f"✅ Added <b>{esc(t)}</b> – {esc(info['name'] or name)} ({esc(info['exchange'] or '')})\n"
-                f"${info['price']:.2f} ({info['chg'] or 0:+.2f}%)\n"
-                f"Searching news for: {esc(t)} / \"{esc(name)}\"")
+        items = parse_items(args)
+        if not items:
+            return "Usage: /add TSLA AAPL NVDA  (or /add TSLA=Tesla Motors for a custom name)"
+        if len(items) > MAX_PER_COMMAND:
+            return f"Too many at once – up to {MAX_PER_COMMAND} stocks per command."
+        added, already, missing = [], [], []
+        for t, custom in items:
+            if any(s["ticker"] == t for s in wl["stocks"]):
+                already.append(t)
+                continue
+            info = price_info(t)
+            if not info or info["price"] is None:
+                missing.append(t)
+                continue
+            name = custom or clean_name(info["name"] or t)
+            wl["stocks"].append({"ticker": t, "name": name})
+            state.setdefault("new_tickers", []).append(t)
+            added.append((t, name, info))
+        if len(added) == 1 and len(items) == 1:
+            t, name, info = added[0]
+            state.setdefault("show_latest", []).append(t)  # single add: also send latest headlines
+            return (f"✅ Added <b>{esc(t)}</b> – {esc(info['name'] or name)} ({esc(info['exchange'] or '')})\n"
+                    f"${info['price']:.2f} ({info['chg'] or 0:+.2f}%)\n"
+                    f"Searching news for: {esc(t)} / \"{esc(name)}\"")
+        lines = [f"✅ <b>{esc(t)}</b> {esc(name)} – ${i['price']:.2f} ({i['chg'] or 0:+.2f}%)" for t, name, i in added]
+        if already:
+            lines.append("Already on the list: " + ", ".join(esc(t) for t in already))
+        if missing:
+            lines.append("❓ Not found on Yahoo Finance: " + ", ".join(esc(t) for t in missing))
+        head = f"Added {len(added)} of {len(items)}:" if added else "Nothing added."
+        return head + "\n" + "\n".join(lines) + f"\n\nTotal on the list: {len(wl['stocks'])}"
     if cmd in ("/remove", "/del", "/delete"):
-        if not args:
-            return "Usage: /remove TICKER"
-        t = args[0].upper().lstrip("$")
-        before = len(stocks)
-        wl["stocks"] = [s for s in stocks if s["ticker"] != t]
-        return f"🗑 Removed {esc(t)}." if len(wl["stocks"]) < before else f"{esc(t)} isn't on the list."
+        items = parse_items(args)
+        if not items:
+            return "Usage: /remove TSLA AAPL NVDA"
+        wanted = [t for t, _ in items]
+        have = {s["ticker"] for s in wl["stocks"]}
+        removed = [t for t in wanted if t in have]
+        not_there = [t for t in wanted if t not in have]
+        wl["stocks"] = [s for s in wl["stocks"] if s["ticker"] not in removed]
+        lines = []
+        if removed:
+            lines.append("🗑 Removed: " + ", ".join(esc(t) for t in removed))
+        if not_there:
+            lines.append("Not on the list: " + ", ".join(esc(t) for t in not_there))
+        return "\n".join(lines) + f"\n\nTotal on the list: {len(wl['stocks'])}"
     if cmd == "/list":
         if not stocks:
             return "The list is empty. Add with /add TICKER"
@@ -359,6 +407,7 @@ def check_once():
 
     handle_commands(wl, state)
     new_tickers = set(state.pop("new_tickers", []))
+    show_latest = set(state.pop("show_latest", []))
     min_score = wl.get("min_score", 1)
     step = wl.get("price_move_alert_percent", 5)
 
@@ -371,7 +420,7 @@ def check_once():
         new = [i for i in news if i["link"] not in seen]
         silent = first_run or t in new_tickers  # don't flood when a stock is first added
         print(f"[{time.strftime('%H:%M:%S')}] {header} — {len(new)} new{' (silent)' if silent else ''}")
-        if t in new_tickers and news:
+        if t in show_latest and news:
             latest = "\n".join(f"• <a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>" for i in news[-3:][::-1])
             send(f"<b>{esc(header)}</b>\nLatest news:\n{latest}")
         for i in new:

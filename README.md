@@ -10,8 +10,9 @@
 | פקודה | מה עושה |
 |---|---|
 | `/add TSLA` | הוספת מניה |
-| `/add TSLA Tesla` | הוספה עם שם לחיפוש |
-| `/remove TSLA` | הסרת מניה |
+| `/add TSLA AAPL NVDA` | הוספת כמה מניות בבת אחת (רווחים, פסיקים או שורות, עד 30) |
+| `/add TSLA=Tesla Motors` | הוספה עם שם לחיפוש |
+| `/remove TSLA AAPL` | הסרת מניה אחת או כמה |
 | `/list` | הרשימה + מחירים |
 | `/market on` / `/market off` | חדשות קריטיות על כל השוק |
 | `/level 1` / `2` / `3` | כמה חדשות לשלוח על הרשימה (1 = הכול, 3 = רק אירועים גדולים) |
@@ -22,7 +23,7 @@
 ## הגדרה ב-GitHub
 1. Settings → Secrets and variables → Actions → New repository secret:
    - `TELEGRAM_BOT_TOKEN`: הטוקן מ-BotFather
-   - `TELEGRAM_CHAT_IDS`: ה-IDs, מופרדים בפסיק (למשל `7410356030,-1001234567890`)
+   - `TELEGRAM_CHAT_IDS`: ה-IDs, מופרדים בפסיק (למשל `123456789,-1001234567890`)
 2. לשונית Actions → **Stock news alerts** → Run workflow (הרצה ראשונה).
 
 ## הרצה מקומית (לא חובה)
