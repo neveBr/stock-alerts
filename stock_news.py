@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stock news alerts -> Telegram. Runs on GitHub Actions (every few minutes) or locally.
+"""Stock news alerts -> Telegram. Runs as a background app on a computer (or on GitHub Actions).
 
 Watchlist alerts: new news about your stocks (+ big price moves). Up to 1000 stocks.
 Market-wide alerts (/market on):
@@ -9,14 +9,20 @@ Control it from Telegram: /add /remove /list /market /level /help
 
 Usage:
   python3 stock_news.py              # one check (what GitHub Actions runs)
-  python3 stock_news.py --loop       # keep running locally
+  python3 stock_news.py --install    # install as a background app (Mac / Windows), starts with the computer
+  python3 stock_news.py --uninstall  # remove the background app
+  python3 stock_news.py --loop       # keep running in this window
   python3 stock_news.py --test-telegram
 Secrets: env TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_IDS (comma separated), or local_secrets.json.
 """
 import hashlib
+import html
 import json
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -188,6 +194,9 @@ MACRO_QUERIES = [
 ]
 
 
+BING_MACRO = ["Federal Reserve rates", "inflation", "jobs report", "tariffs", "oil prices", "stock market"]
+
+
 def score(title):
     t = title.lower()
     s, hits = 0, []
@@ -269,13 +278,13 @@ def secrets():
     return tok.strip(), [str(c).strip() for c in chats if str(c).strip()]
 
 
-def tg(method, **params):
+def tg(method, _wait=30, **params):
     tok, _ = secrets()
     if not tok:
         return None
     data = urllib.parse.urlencode(params).encode()
     try:
-        with urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/{method}", data, timeout=30) as r:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/{method}", data, timeout=_wait) as r:
             return json.loads(r.read())
     except Exception as e:
         print(f"[warn] Telegram {method} failed: {e}", file=sys.stderr)
@@ -340,6 +349,117 @@ class Google:
             cls.failures += 1
             print(f"[warn] Google: {e}", file=sys.stderr)
             return []
+
+
+def bing(query):
+    """Bing News RSS: gives a short description of each article (Google News gives only the headline)."""
+    url = "https://www.bing.com/news/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "rss", "mkt": "en-US", "setlang": "en"})
+    try:
+        items = parse_feed(http_get(url), "Bing News")
+    except Exception as e:
+        print(f"[warn] Bing: {e}", file=sys.stderr)
+        return []
+    for i in items:
+        real = urllib.parse.parse_qs(urllib.parse.urlparse(i["link"]).query).get("url")
+        if real:
+            i["link"] = real[0]
+            i["domain"] = urllib.parse.urlparse(real[0]).netloc.lower().replace("www.", "")
+    return recent(items, 72)  # Bing also returns old stories
+
+
+# ---------- short summary of each article (in Hebrew by default) ----------
+WIRE = r"(/\s*PRNewswire\s*/|\(GLOBE NEWSWIRE\)|\(BUSINESS WIRE\)|/CNW/|\(ACCESSWIRE\)|\(Newsfile Corp\.\)|/EINPresswire\.com/)"
+DATELINE_RE = re.compile(r"[A-ZÀ-Ý][A-ZÀ-Ý.'’ -]{2,40}(?:,\s*[A-Z][A-Za-z.' ]{1,30})?,\s+"
+                         r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+\d{4}\s*"
+                         r"(?:" + WIRE + r")?\s*(?:--|–|—)?\s*")
+WIRE_RE = re.compile(WIRE + r"\s*(--|–|—)?\s*", re.I)
+
+
+def summary(i, limit=280):
+    """First sentence or two of the article's description ('' when the feed has none, e.g. Google News)."""
+    d = re.sub(r"\s+", " ", html.unescape(i.get("desc") or "")).strip()
+    d = re.sub(r"\s+\.", ".", DATELINE_RE.sub(". ", d))
+    d = re.sub(r"^.{0,80}?\((?:Reuters|Bloomberg|AP|Dow Jones)\)\s*[-–—]+\s*", "", d)  # "BEIJING, Nov 9 (Reuters) -"
+    d = WIRE_RE.sub(" ", d).strip(" .-–—")
+    head = re.sub(r"\W+", "", i["title"].rsplit(" - ", 1)[0].lower())
+    if len(d) < 40 or re.sub(r"\W+", "", d.lower()).startswith(head[:50]):
+        return ""  # nothing beyond the headline
+    out = ""
+    for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z\"“])", d):
+        if out and len(out) + len(sent) > limit:
+            break
+        out += (" " if out else "") + sent
+    if len(out) > limit:
+        out = out[:limit].rsplit(" ", 1)[0] + "…"
+    return out
+
+
+class Translate:
+    """Free Google Translate endpoints (no key needed); falls back to English if both fail."""
+    cache, failures = {}, 0
+
+    @staticmethod
+    def _chrome(text, tl):
+        url = "https://clients5.google.com/translate_a/t?" + urllib.parse.urlencode(
+            {"client": "dict-chrome-ex", "sl": "auto", "tl": tl, "q": text})
+        r = json.loads(http_get(url))[0]
+        return r[0] if isinstance(r, list) else r
+
+    @staticmethod
+    def _gtx(text, tl):
+        url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
+            {"client": "gtx", "sl": "auto", "tl": tl, "dt": "t", "q": text})
+        return "".join(seg[0] for seg in json.loads(http_get(url))[0] if seg and seg[0])
+
+    @classmethod
+    def to(cls, text, lang):
+        if not text or lang == "en" or cls.failures >= 3:
+            return text
+        key = (text, lang)
+        if key not in cls.cache:
+            tl = {"he": "iw"}.get(lang, lang)
+            for fn in (cls._chrome, cls._gtx):
+                try:
+                    cls.cache[key] = fn(text, tl) or text
+                    break
+                except Exception as e:
+                    print(f"[warn] translate ({fn.__name__}): {e}", file=sys.stderr)
+            else:
+                cls.failures += 1
+                return text
+            time.sleep(0.2)
+        return cls.cache[key]
+
+
+def split_source(title):
+    """'Headline - Reuters' -> ('Headline', 'Reuters')"""
+    head, _, src = title.rpartition(" - ")
+    return (head, src) if head and 0 < len(src) <= 40 else (title, "")
+
+
+def item_block(i, lang):
+    """Translated headline + short explanation, then the original headline as the link."""
+    head, src = split_source(i["title"])
+    src = src or i.get("domain") or urllib.parse.urlparse(i["link"]).netloc.replace("www.", "") or i.get("source", "")
+    about = summary(i)
+    lines = []
+    if lang != "en":  # headline + explanation in one request
+        tr = Translate.to(head + ("\n" + about if about else ""), lang).split("\n", 1)
+        head_tr, about = tr[0], (tr[1] if len(tr) > 1 else about)
+        lines.append(f"<b>{esc(head_tr)}</b>")
+    if about:
+        lines.append(esc(about))
+    lines.append(f"🔗 <a href=\"{esc(i['link'])}\">{esc(head)}</a>" + (f" · <i>{esc(src)}</i>" if src else ""))
+    return "\n".join(lines)
+
+
+def blocks(items, lang):
+    return [item_block(i, lang) for i in items]  # one by one: the translator limits parallel requests
+
+
+def short_title(i, lang):
+    return Translate.to(split_source(i["title"])[0], lang)
 
 
 # ---------- prices ----------
@@ -410,16 +530,19 @@ def fetch_stock_news(stock):
     except Exception as e:
         print(f"[warn] Yahoo {t}: {e}", file=sys.stderr)
     items += Google.search(f'{t} OR "{stock["name"]}" when:7d')
+    items += bing(f'"{stock["name"]}" OR {t} stock')
     return dedupe([i for i in items if mentions(i["title"], stock)])
 
 
 def dedupe(items):
-    out, keys = [], set()
+    out, keys = [], {}
     for i in items:
         k = re.sub(r"\W+", "", i["title"].lower().split(" - ")[0])[:80]
         if k not in keys:
-            keys.add(k)
+            keys[k] = i
             out.append(i)
+        elif len(i.get("desc") or "") > len(keys[k].get("desc") or ""):
+            keys[k]["desc"] = i["desc"]  # same story from another source: borrow its description
     out.sort(key=lambda i: i["date"].timestamp() if i["date"] else 0)
     return out
 
@@ -448,10 +571,21 @@ def fetch_critical_news():
 
 def fetch_macro_news():
     items = []
-    with ThreadPoolExecutor(4) as ex:
+    with ThreadPoolExecutor(5) as ex:
         for res in ex.map(Google.search, MACRO_QUERIES):
             items += [i for i in res if i["domain"] in MACRO_SITES]
-    return dedupe(recent(items))
+        donors = [i for res in ex.map(bing, BING_MACRO) for i in res]
+    return borrow_desc(dedupe(recent(items)), donors)
+
+
+def borrow_desc(items, donors):
+    """Google News has only headlines: take the summary from the same story on Bing (often via MSN)."""
+    key = lambda i: re.sub(r"\W+", "", split_source(i["title"])[0].lower())[:60]
+    by_title = {key(d): d["desc"] for d in donors if d.get("desc")}
+    for i in items:
+        if not summary(i) and key(i) in by_title:
+            i["desc"] = by_title[key(i)]
+    return items
 
 
 # ---------- telegram commands ----------
@@ -466,6 +600,8 @@ HELP = f"""<b>📊 Stock Alerts – commands</b>
 /sectors mine – sector news only for your stocks' sectors (+ whole-market news)
 /sectors all – sector news for every sector
 /level 1|2|3 – which watchlist news to send (1 = most, 3 = only big)
+/lang he|en – language of the short explanations (Hebrew / English)
+/status – is the app running, on which computer, last check
 /help – this message"""
 
 
@@ -490,11 +626,13 @@ def parse_items(args):
     return out
 
 
-def handle_commands(wl, state):
+def handle_commands(wl, state, wait=0):
+    """Answer Telegram commands. wait > 0 = long polling (answers within a second). Returns how many, or None on error."""
     _, allowed = secrets()
-    res = tg("getUpdates", offset=state.get("tg_offset", 0), timeout=0)
+    res = tg("getUpdates", _wait=wait + 15, offset=state.get("tg_offset", 0), timeout=wait)
     if not res or not res.get("ok"):
-        return
+        return None
+    n = 0
     for u in res["result"]:
         state["tg_offset"] = u["update_id"] + 1
         msg = u.get("message") or u.get("channel_post") or {}
@@ -512,9 +650,11 @@ def handle_commands(wl, state):
             first, _, more = first.partition("\n")
             rest = more + "\n" + rest
         cmd = first.split("@")[0].lower()
+        n += 1
         reply = run_command(cmd, [rest] if rest.strip() else [], wl, state)
         if reply:
             send(reply, chat)
+    return n
 
 
 def sectors_status(wl):
@@ -623,6 +763,15 @@ def run_command(cmd, args, wl, state):
         if args and args[0].strip() in ("1", "2", "3"):
             wl["min_score"] = int(args[0].strip())
         return f"Level: {wl.get('min_score', 1)} (1 = all relevant news, 3 = only big events)"
+    if cmd == "/lang":
+        if args and args[0].strip().lower() in ("he", "en"):
+            wl["lang"] = args[0].strip().lower()
+        return f"Explanations language: {'Hebrew' if wl.get('lang', 'he') == 'he' else 'English'} (/lang he or /lang en)"
+    if cmd == "/status":
+        last = state.get("last_check")
+        ago = f"{(time.time() - last) / 60:.0f} min ago" if last else "never"
+        return (f"✅ Running on <b>{esc(state.get('host') or computer_name())}</b>\n"
+                f"Last full check: {ago}\nStocks: {len(wl['stocks'])}")
     return "Unknown command. /help"
 
 
@@ -667,6 +816,7 @@ def check_once():
     save(WATCHLIST, wl)  # commands take effect even if a later step fails
     show_latest = set(state.pop("show_latest", []))
     min_score = wl.get("min_score", 1)
+    lang = wl.get("lang", "he")
     step = wl.get("price_move_alert_percent", 5)
     stocks = wl["stocks"][:MAX_STOCKS]
     names = {s["ticker"]: s["name"] for s in stocks}
@@ -696,31 +846,32 @@ def check_once():
         p = px.get(t)
         header = f"📈 {t} ({s['name']})" + (f" — {fmt_price(p)}" if p else "")
         if t in show_latest and news:
-            latest = "\n".join(f"• <a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>" for i in news[-3:][::-1])
-            send(f"<b>{esc(header)}</b>\nLatest news:\n{latest}")
+            send(f"<b>{esc(header)}</b>\nLatest news:\n\n" + "\n\n".join(blocks(news[-3:][::-1], lang)))
         for i in news:
             lid = link_id(i["link"])
-            if lid in seen:
+            tid = "t" + link_id(re.sub(r"\W+", "", split_source(i["title"])[0].lower())[:80])
+            if lid in seen or tid in seen:  # same link, or same headline from another source
                 continue
-            seen[lid] = today
-            sc, _ = score(i["title"])
+            seen[lid] = seen[tid] = today
+            sc, hits = score(i["title"])
             if silent or sc < min_score:
                 continue
             tag = "🔴 HIGH" if sc >= 3 else ("🟡 MED" if sc >= 2 else "⚪ low")
-            alerts.append((sc, header, tag, i))
+            alerts.append((sc, header, tag + (f" · {', '.join(hits[:3])}" if hits else ""), i))
         inited.add(t)
     state["priority"] = [t for t in state.get("priority", []) if t not in {s["ticker"] for s in batch}]
     print(f"[{time.strftime('%H:%M:%S')}] {len(stocks)} stocks, news checked for {len(batch)}, "
           f"{len(alerts)} alerts, {len(big_moves)} big moves")
 
     if len(alerts) <= MAX_SINGLE_ALERTS:
-        for sc, header, tag, i in alerts:
-            send(f"<b>{esc(header)}</b>\n{tag} <a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>")
-    else:  # many at once -> one digest, most important first
+        for (sc, header, tag, i), block in zip(alerts, blocks([a[3] for a in alerts], lang)):
+            send(f"<b>{esc(header)}</b>\n{esc(tag)}\n\n{block}")
+    else:  # many at once -> one digest, most important first (translated headline as the link)
         alerts.sort(key=lambda a: -a[0])
+        titles = [short_title(a[3], lang) for a in alerts]
         send(f"<b>📰 {len(alerts)} news items on your stocks</b>\n" + "\n".join(
-            f"{tag} <b>{esc(header.split(' ')[1])}</b> <a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>"
-            for sc, header, tag, i in alerts))
+            f"{tag.split(' ·')[0]} <b>{esc(header.split(' ')[1])}</b> <a href=\"{esc(i['link'])}\">{esc(t)}</a>"
+            for (sc, header, tag, i), t in zip(alerts, titles)))
     if big_moves:
         big_moves.sort(key=lambda m: -abs(m[1]["chg"]))
         send("<b>⚠️ Big moves today</b>\n" + "\n".join(
@@ -739,8 +890,7 @@ def check_once():
             if k:
                 m = TICKER_RE.search(i["title"] + " " + i["desc"])
                 tick = f" <b>${esc(m.group(1).upper())}</b>" if m else ""
-                out.append(f"🚨 <b>Critical company news</b>{tick}\n<a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>\n"
-                           f"<i>[{esc(i['source'])} · {esc(k)}]</i>")
+                out.append((f"🚨 <b>Critical company news</b>{tick} · {esc(k)}", i))
         only_mine = wl.get("sector_filter", "mine") == "mine"
         mine = set(my_sectors(wl))
         for i in fetch_macro_news():
@@ -758,14 +908,16 @@ def check_once():
                 continue
             where = ", ".join(sectors) if sectors else "Whole market"
             icon = "🏭 <b>Sector news</b>" if sectors else "🌍 <b>Market news</b>"
-            out.append(f"{icon} · {esc(name)}\n<a href=\"{esc(i['link'])}\">{esc(i['title'])}</a>\n"
-                       f"<i>Affects: {esc(where)}</i>")
+            out.append((f"{icon} · {esc(name)}\n<i>Affects: {esc(where)}</i>", i))
         if not market_silent:
-            for msg in out[:MAX_MARKET_ALERTS]:
-                send(msg)
+            out = out[:MAX_MARKET_ALERTS]
+            for (head, i), block in zip(out, blocks([o[1] for o in out], lang)):
+                send(f"{head}\n\n{block}")
         state["market_init"] = True
 
     state["initialized"] = True
+    state["last_check"] = int(time.time())
+    state["host"] = computer_name()
     state["seen_ids"] = seen
     state["inited"] = sorted(inited & {s["ticker"] for s in stocks})
     state["moves"] = dict(list(moves.items())[-300:])
@@ -775,7 +927,183 @@ def check_once():
     print(f"done in {time.time() - t0:.1f}s")
 
 
+# ---------- background app ----------
+def computer_name():
+    if sys.platform == "darwin":
+        try:
+            return subprocess.run(["scutil", "--get", "ComputerName"], capture_output=True, text=True).stdout.strip()
+        except Exception:
+            pass
+    return os.environ.get("COMPUTERNAME") or socket.gethostname()
+
+
+APP_DIR = Path.home() / "StockAlerts"
+APP_FILES = ["stock_news.py", "watchlist.json", "README.md"]
+LOG = BASE / "stock_alerts.log"
+STOP = BASE / "STOP"
+MAC_PLIST = Path.home() / "Library/LaunchAgents/com.stockalerts.bot.plist"
+WIN_STARTUP = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/StockAlerts.vbs"
+LOCK_PORT = 47613
+_lock = None
+
+
+def commands_only(wait):
+    """Wait up to `wait` seconds for Telegram commands and answer them right away."""
+    wl = load(WATCHLIST, {"stocks": []})
+    state = load(STATE, {})
+    before = state.get("tg_offset")
+    n = handle_commands(wl, state, wait)
+    if n:
+        fill_sectors(wl["stocks"])
+        save(WATCHLIST, wl)
+    if state.get("tg_offset") != before:
+        save(STATE, state, pretty=False)
+    return n, bool(state.get("show_latest"))
+
+
+def to_log():
+    """Background mode: write output to stock_alerts.log (kept under ~2 MB)."""
+    if LOG.exists() and LOG.stat().st_size > 2_000_000:
+        LOG.replace(LOG.with_suffix(".old.log"))
+    f = open(LOG, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = f
+
+
+def live_loop():
+    global _lock
+    try:  # only one copy may run (two would send every alert twice)
+        _lock = socket.socket()
+        _lock.bind(("127.0.0.1", LOCK_PORT))
+    except OSError:
+        print("Stock Alerts is already running on this computer.")
+        return
+    STOP.unlink(missing_ok=True)
+    every = int(os.environ.get("CHECK_EVERY_MINUTES", "2"))
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Live mode: news every {every} min, "
+          "Telegram commands answered right away. Ctrl+C to stop.")
+    next_check = 0
+    while not STOP.exists():
+        if time.time() >= next_check:
+            try:
+                check_once()
+            except Exception as e:
+                print(f"[error] {e}", file=sys.stderr)
+            next_check = time.time() + every * 60
+            if LOG.exists() and LOG.stat().st_size > 2_000_000 and sys.stdout is not sys.__stdout__:
+                to_log()
+        try:
+            n, added = commands_only(int(max(1, min(25, next_check - time.time()))))
+        except Exception as e:
+            print(f"[error] commands: {e}", file=sys.stderr)
+            n, added = None, False
+        if n is None:  # no internet / Telegram down: wait a bit
+            time.sleep(min(30, max(0, next_check - time.time())))
+        elif added:
+            next_check = 0  # a stock was just added: fetch its news now
+    STOP.unlink(missing_ok=True)
+    print("Stopped.")
+
+
+def ask_secrets(path):
+    global SECRETS
+    SECRETS = path
+    tok, chats = secrets()
+    if tok and chats:
+        if input(f"Telegram is already set up ({len(chats)} chats). Keep it? [Y/n] ").strip().lower() != "n":
+            return True
+    print("\nTelegram bot token – from @BotFather (looks like 123456789:AA...):")
+    tok = input("> ").strip()
+    print("\nChat IDs to send to, separated by commas (your private chat, and the group ID which starts with -):")
+    chats = [c.strip() for c in input("> ").replace(" ", ",").split(",") if c.strip()]
+    save(path, {"telegram_bot_token": tok, "telegram_chat_ids": chats})
+    me = tg("getMe")
+    if not me or not me.get("ok"):
+        print("\n❌ Telegram rejected the token (or there is no internet). Run the installer again.")
+        return False
+    send("✅ Stock Alerts is installed on " + esc(computer_name()) + ". Send /help for commands.")
+    print(f"\n✅ Connected to @{me['result'].get('username')} – a test message was sent.")
+    return True
+
+
+def install():
+    try:
+        http_get("https://api.telegram.org")
+    except urllib.error.HTTPError:
+        pass
+    except Exception as e:
+        print(f"❌ No secure internet connection from Python: {e}")
+        if sys.platform == "darwin" and "CERTIFICATE" in str(e).upper():
+            print('Fix: open Applications > Python 3.x and double-click "Install Certificates.command", then run this again.')
+        return
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    for name in APP_FILES:  # never overwrite the list / settings already on this computer
+        src, dst = BASE / name, APP_DIR / name
+        if src.exists() and src.resolve() != dst.resolve() and (name == "stock_news.py" or not dst.exists()):
+            shutil.copy2(src, dst)
+    if not ask_secrets(APP_DIR / "local_secrets.json"):
+        return
+    script = str(APP_DIR / "stock_news.py")
+    uninstall(quiet=True)
+    if sys.platform == "darwin":
+        MAC_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        args = ["/usr/bin/caffeinate", "-i", sys.executable, script, "--loop", "--background"]
+        MAC_PLIST.write_text('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            '<key>Label</key><string>com.stockalerts.bot</string>\n'
+            '<key>ProgramArguments</key><array>' + "".join(f"<string>{esc(a)}</string>" for a in args) + '</array>\n'
+            '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n'
+            f'<key>WorkingDirectory</key><string>{esc(APP_DIR)}</string>\n'
+            f'<key>StandardErrorPath</key><string>{esc(APP_DIR / "launchd.log")}</string>\n'
+            '</dict></plist>\n')
+        subprocess.run(["launchctl", "load", "-w", str(MAC_PLIST)], check=False)
+        where = "It starts by itself when you log in to this Mac, and keeps the Mac awake while it's on (closing a laptop lid still puts it to sleep)."
+    elif os.name == "nt":
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        pyw = pyw if pyw.exists() else Path(sys.executable)
+        WIN_STARTUP.parent.mkdir(parents=True, exist_ok=True)
+        WIN_STARTUP.write_text('CreateObject("WScript.Shell").Run """' + str(pyw) + '"" ""' + script +
+                               '"" --loop --background", 0, False\n', encoding="utf-16")
+        subprocess.Popen(["wscript", str(WIN_STARTUP)])
+        where = ("It starts by itself when you sign in to Windows. "
+                 "To keep it working, set Settings > System > Power > Sleep to Never (when plugged in).")
+    else:
+        print(f"Installed in {APP_DIR}. On Linux, add this to crontab -e:\n@reboot {sys.executable} {script} --loop --background")
+        return
+    print(f"\n✅ Stock Alerts is running in the background (folder: {APP_DIR}).\n{where}\n"
+          "Send /status to the bot to check it. Log: stock_alerts.log in that folder.")
+
+
+def uninstall(quiet=False):
+    if sys.platform == "darwin" and MAC_PLIST.exists():
+        subprocess.run(["launchctl", "unload", "-w", str(MAC_PLIST)], check=False, capture_output=True)
+        MAC_PLIST.unlink()
+    if os.name == "nt" and WIN_STARTUP.exists():
+        WIN_STARTUP.unlink()
+    try:  # ask a running copy to stop
+        with socket.socket() as t:
+            t.bind(("127.0.0.1", LOCK_PORT))
+    except OSError:
+        (APP_DIR / "STOP").write_text("stop")
+        for _ in range(60):
+            time.sleep(1)
+            try:
+                with socket.socket() as t:
+                    t.bind(("127.0.0.1", LOCK_PORT))
+                break
+            except OSError:
+                pass
+    if not quiet:
+        print(f"✅ Stock Alerts was removed from startup and stopped. Your list and settings stay in {APP_DIR} "
+              "(delete that folder to remove everything).")
+
+
 def main():
+    for f in (sys.stdout, sys.stderr):  # emoji on old Windows consoles
+        try:
+            f.reconfigure(errors="replace")
+        except Exception:
+            pass
     if "--test-telegram" in sys.argv:
         tok, chats = secrets()
         if not tok or not chats:
@@ -783,15 +1111,14 @@ def main():
             return
         send("✅ Stock Alerts is connected. Send /help for commands.")
         return
+    if "--install" in sys.argv:
+        return install()
+    if "--uninstall" in sys.argv:
+        return uninstall()
     if "--loop" in sys.argv:
-        every = int(os.environ.get("CHECK_EVERY_MINUTES", "3"))
-        print(f"Live mode: every {every} min. Ctrl+C to stop.")
-        while True:
-            try:
-                check_once()
-            except Exception as e:
-                print(f"[error] {e}", file=sys.stderr)
-            time.sleep(every * 60)
+        if "--background" in sys.argv or sys.stdout is None:
+            to_log()
+        return live_loop()
     check_once()
 
 
