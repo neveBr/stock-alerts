@@ -25,10 +25,27 @@ end run
 AS
 }
 
-PY=""
-for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-  if [ -x "$p" ] && "$p" -c "" >/dev/null 2>&1; then PY="$p"; break; fi
+# Pick a Python 3 that can open secure (https) connections. Apple's own Python first: it uses the Mac's certificates.
+HTTPS_TEST='import urllib.request, urllib.error
+try: urllib.request.urlopen("https://api.telegram.org", timeout=15)
+except urllib.error.HTTPError: pass'
+PY=""; ANY_PY=""
+for p in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  if [ -x "$p" ] && "$p" -c "" >/dev/null 2>&1; then
+    [ -z "$ANY_PY" ] && ANY_PY="$p"
+    if "$p" -c "$HTTPS_TEST" >/dev/null 2>&1; then PY="$p"; break; fi
+  fi
 done
+if [ -z "$PY" ] && [ -n "$ANY_PY" ]; then
+  ERR="$("$ANY_PY" -c "$HTTPS_TEST" 2>&1 | tail -1)"
+  dlg "Stock Alerts can't reach Telegram.
+
+• Check that this Mac is connected to the internet.
+• If you installed Python from python.org: open Applications → Python 3.x and double-click Install Certificates.command, then open Stock Alerts again.
+
+Details: $ERR" "OK" >/dev/null
+  exit 0
+fi
 if [ -z "$PY" ]; then
   dlg "Stock Alerts needs Python 3, which comes with Apple's free Command Line Tools.
 
@@ -58,9 +75,19 @@ setup_telegram() {
   TOKEN="$(ask "Paste your Telegram bot token.
 
 You get it from @BotFather in Telegram. It looks like 123456789:AAH..." "")" || exit 0
-  TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+  TOKEN="$(printf '%s' "$TOKEN" | LC_ALL=C tr -cd 'A-Za-z0-9:_-')"  # drop spaces and invisible characters from pasting
   INFO="$(STOCK_ALERTS_TOKEN="$TOKEN" "$PY" "$SCRIPT" --detect-chats 2>/dev/null)" || {
-    dlg "Telegram didn't accept this token, or there is no internet. Check the token and try again." "OK" >/dev/null; exit 0; }
+    case "$INFO" in
+      BADTOKEN*) dlg "Telegram says this token is wrong.
+
+Copy it again from @BotFather: /mybots → your bot → API Token. It looks like 123456789:AAH... (about 46 characters, with one colon)." "OK" >/dev/null ;;
+      *) dlg "Couldn't reach Telegram to check the token.
+
+Check the internet connection and try again.
+
+Details: ${INFO#NET }" "OK" >/dev/null ;;
+    esac
+    exit 0; }
   BOT="${INFO%%|*}"
   [ "$(dlg "Now open Telegram and send /start to @$BOT – in your private chat with the bot, and in the alerts group.
 

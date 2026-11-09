@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -1009,6 +1010,8 @@ def ask_secrets(path):
     SECRETS = path
     tok, chats = secrets()
     new_tok, new_chats = os.environ.get("STOCK_ALERTS_TOKEN"), os.environ.get("STOCK_ALERTS_CHATS")  # from the Mac app
+    if new_tok:
+        new_tok = re.sub(r"[^A-Za-z0-9:_-]", "", new_tok)
     if tok and chats and not new_tok:
         if os.environ.get("STOCK_ALERTS_KEEP") or \
                 input(f"Telegram is already set up ({len(chats)} chats). Keep it? [Y/n] ").strip().lower() != "n":
@@ -1094,9 +1097,18 @@ def detect_chats():
     """For the Mac app: check the token and list chats that recently messaged the bot. Prints 'username|id1,id2'."""
     global SECRETS
     SECRETS = Path("/nonexistent")
-    os.environ["TELEGRAM_BOT_TOKEN"] = os.environ.get("STOCK_ALERTS_TOKEN", "").strip()
-    me = tg("getMe")
-    if not me or not me.get("ok"):
+    tok = re.sub(r"[^A-Za-z0-9:_-]", "", os.environ.get("STOCK_ALERTS_TOKEN", ""))  # invisible chars from pasting
+    os.environ["TELEGRAM_BOT_TOKEN"] = tok
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", tok):
+        print("BADTOKEN format")
+        return False
+    try:
+        me = json.loads(urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/getMe", timeout=20).read())
+    except urllib.error.HTTPError as e:
+        print(f"BADTOKEN {e.code}" if e.code in (401, 404) else f"NET Telegram error {e.code}")
+        return False
+    except Exception as e:
+        print(f"NET {e}")
         return False
     ids = []
     res = tg("getUpdates") or {}  # no offset: only reads, doesn't mark anything as handled
