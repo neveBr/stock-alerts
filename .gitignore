@@ -4,3 +4,4 @@ state.json
 stock_alerts*.log
 launchd.log
 STOP
+dist/

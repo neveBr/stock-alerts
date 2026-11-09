@@ -1008,13 +1008,19 @@ def ask_secrets(path):
     global SECRETS
     SECRETS = path
     tok, chats = secrets()
-    if tok and chats:
-        if input(f"Telegram is already set up ({len(chats)} chats). Keep it? [Y/n] ").strip().lower() != "n":
+    new_tok, new_chats = os.environ.get("STOCK_ALERTS_TOKEN"), os.environ.get("STOCK_ALERTS_CHATS")  # from the Mac app
+    if tok and chats and not new_tok:
+        if os.environ.get("STOCK_ALERTS_KEEP") or \
+                input(f"Telegram is already set up ({len(chats)} chats). Keep it? [Y/n] ").strip().lower() != "n":
             return True
-    print("\nTelegram bot token – from @BotFather (looks like 123456789:AA...):")
-    tok = input("> ").strip()
-    print("\nChat IDs to send to, separated by commas (your private chat, and the group ID which starts with -):")
-    chats = [c.strip() for c in input("> ").replace(" ", ",").split(",") if c.strip()]
+    if new_tok:
+        tok, chats_text = new_tok.strip(), new_chats or ""
+    else:
+        print("\nTelegram bot token – from @BotFather (looks like 123456789:AA...):")
+        tok = input("> ").strip()
+        print("\nChat IDs to send to, separated by commas (your private chat, and the group ID which starts with -):")
+        chats_text = input("> ")
+    chats = [c.strip() for c in chats_text.replace(" ", ",").split(",") if c.strip()]
     save(path, {"telegram_bot_token": tok, "telegram_chat_ids": chats})
     me = tg("getMe")
     if not me or not me.get("ok"):
@@ -1034,14 +1040,14 @@ def install():
         print(f"❌ No secure internet connection from Python: {e}")
         if sys.platform == "darwin" and "CERTIFICATE" in str(e).upper():
             print('Fix: open Applications > Python 3.x and double-click "Install Certificates.command", then run this again.')
-        return
+        return False
     APP_DIR.mkdir(parents=True, exist_ok=True)
     for name in APP_FILES:  # never overwrite the list / settings already on this computer
         src, dst = BASE / name, APP_DIR / name
         if src.exists() and src.resolve() != dst.resolve() and (name == "stock_news.py" or not dst.exists()):
             shutil.copy2(src, dst)
     if not ask_secrets(APP_DIR / "local_secrets.json"):
-        return
+        return False
     script = str(APP_DIR / "stock_news.py")
     uninstall(quiet=True)
     if sys.platform == "darwin":
@@ -1069,9 +1075,38 @@ def install():
                  "To keep it working, set Settings > System > Power > Sleep to Never (when plugged in).")
     else:
         print(f"Installed in {APP_DIR}. On Linux, add this to crontab -e:\n@reboot {sys.executable} {script} --loop --background")
-        return
+        return True
     print(f"\n✅ Stock Alerts is running in the background (folder: {APP_DIR}).\n{where}\n"
           "Send /status to the bot to check it. Log: stock_alerts.log in that folder.")
+    return True
+
+
+def is_running():
+    try:
+        with socket.socket() as t:
+            t.bind(("127.0.0.1", LOCK_PORT))
+        return False
+    except OSError:
+        return True
+
+
+def detect_chats():
+    """For the Mac app: check the token and list chats that recently messaged the bot. Prints 'username|id1,id2'."""
+    global SECRETS
+    SECRETS = Path("/nonexistent")
+    os.environ["TELEGRAM_BOT_TOKEN"] = os.environ.get("STOCK_ALERTS_TOKEN", "").strip()
+    me = tg("getMe")
+    if not me or not me.get("ok"):
+        return False
+    ids = []
+    res = tg("getUpdates") or {}  # no offset: only reads, doesn't mark anything as handled
+    for u in res.get("result", []):
+        msg = u.get("message") or u.get("channel_post") or u.get("my_chat_member") or {}
+        c = str(msg.get("chat", {}).get("id", ""))
+        if c and c not in ids:
+            ids.append(c)
+    print(f"{me['result'].get('username', '')}|{','.join(ids)}")
+    return True
 
 
 def uninstall(quiet=False):
@@ -1112,7 +1147,11 @@ def main():
         send("✅ Stock Alerts is connected. Send /help for commands.")
         return
     if "--install" in sys.argv:
-        return install()
+        sys.exit(0 if install() else 1)
+    if "--running" in sys.argv:
+        sys.exit(0 if is_running() else 1)
+    if "--detect-chats" in sys.argv:
+        sys.exit(0 if detect_chats() else 1)
     if "--uninstall" in sys.argv:
         return uninstall()
     if "--loop" in sys.argv:
